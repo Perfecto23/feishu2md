@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -61,15 +62,41 @@ func (c *Client) DownloadImage(ctx context.Context, imgToken, outDir string) (st
 	// 构建完整的文件路径
 	filename := filepath.Join(outDir, fmt.Sprintf("%s%s", imgToken, fileext))
 
+	// 先将远端文件读入内存，便于按类型进行无损压缩处理（目前仅对 PNG 应用）
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, resp.File); err != nil {
+		return imgToken, fmt.Errorf("读取远端文件失败: %v", err)
+	}
+
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666)
 	if err != nil {
 		return imgToken, fmt.Errorf("创建文件失败: %v", err)
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, resp.File)
-	if err != nil {
-		return imgToken, fmt.Errorf("写入文件失败: %v", err)
+	// 对 PNG 进行无损压缩（BestCompression）。若解码/编码失败则回退为原始字节写入。
+	if strings.EqualFold(fileext, ".png") {
+		if img, err := png.Decode(bytes.NewReader(buf.Bytes())); err == nil {
+			enc := png.Encoder{CompressionLevel: png.BestCompression}
+			if err := enc.Encode(file, img); err == nil {
+				// 已完成优化写入
+			} else {
+				// 编码失败，回退原始字节
+				if _, werr := file.Write(buf.Bytes()); werr != nil {
+					return imgToken, fmt.Errorf("写入文件失败: %v", werr)
+				}
+			}
+		} else {
+			// 解码失败，回退原始字节
+			if _, werr := file.Write(buf.Bytes()); werr != nil {
+				return imgToken, fmt.Errorf("写入文件失败: %v", werr)
+			}
+		}
+	} else {
+		// 其他类型暂不处理，直接原样写入
+		if _, werr := file.Write(buf.Bytes()); werr != nil {
+			return imgToken, fmt.Errorf("写入文件失败: %v", werr)
+		}
 	}
 
 	// 返回相对路径，用于markdown引用
