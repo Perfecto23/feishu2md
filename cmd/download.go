@@ -70,6 +70,40 @@ func shouldSkipFile(outputPath, content string, skipDuplicate bool) bool {
 // dlConfig 保存当前下载操作的配置
 var dlConfig core.Config
 
+// DownloadStats 用于跨文档统计下载/缓存命中等信息（主要用于 wiki-tree 汇总）
+type DownloadStats struct {
+	mu          sync.Mutex
+	totalDocs   int
+	docsNew     int
+	totalImages int
+	imagesNew   int
+}
+
+func (s *DownloadStats) SetTotalDocs(n int) {
+	s.mu.Lock()
+	s.totalDocs = n
+	s.mu.Unlock()
+}
+func (s *DownloadStats) AddDocNew() {
+	s.mu.Lock()
+	s.docsNew++
+	s.mu.Unlock()
+}
+func (s *DownloadStats) AddImages(encountered, newlyDownloaded int) {
+	s.mu.Lock()
+	s.totalImages += encountered
+	s.imagesNew += newlyDownloaded
+	s.mu.Unlock()
+}
+func (s *DownloadStats) Snapshot() (totalDocs, docsNew, totalImages, imagesNew int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.totalDocs, s.docsNew, s.totalImages, s.imagesNew
+}
+
+// dlStats 在 wiki-tree 模式下初始化用于统计；其他模式保持 nil
+var dlStats *DownloadStats
+
 // downloadDocument 下载单个飞书文档并转换为Markdown
 // 它处理文档验证、内容检索、图片处理和文件输出
 func downloadDocument(ctx context.Context, client *core.Client, url string, opts *DownloadOpts) error {
@@ -105,7 +139,28 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 				`请参考Readme/Release获取v1_support信息。`)
 	}
 
-	// 处理下载
+	// 处理下载：先快速获取文档元信息（包含 RevisionID），用于命中跳过
+	meta, err := client.GetDocxDocumentMeta(ctx, docToken)
+	utils.CheckErr(err)
+
+	// 如果开启跳过重复，并且本地存在同名 md 文件，同时可读取历史 RevisionID，且一致，则直接跳过
+	// 仅在使用标题作为文件名时，文件名依赖 meta.Title；否则用 token
+	mdName := fmt.Sprintf("%s.md", docToken)
+	if dlConfig.Output.TitleAsFilename {
+		mdName = fmt.Sprintf("%s.md", utils.SanitizeFileName(meta.Title))
+	}
+	outputPath := filepath.Join(opts.outputDir, mdName)
+	revPath := outputPath + ".rev"
+	if !opts.forceDownload && opts.skipDuplicate && fileExists(outputPath) && fileExists(revPath) {
+		if b, err := os.ReadFile(revPath); err == nil {
+			if strings.TrimSpace(string(b)) == fmt.Sprint(meta.RevisionID) {
+				fmt.Printf("⏭️  修订未变化，跳过: %s\n", meta.Title)
+				return nil
+			}
+		}
+	}
+
+	// 未命中快速跳过，拉取块内容
 	docx, blocks, err := client.GetDocxContent(ctx, docToken)
 	utils.CheckErr(err)
 
@@ -115,22 +170,83 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	markdown := parser.ParseDocxContent(docx, blocks)
 
 	if !dlConfig.Output.SkipImgDownload && len(parser.ImgTokens) > 0 {
-		successCount := 0
-		for _, imgToken := range parser.ImgTokens {
-			localLink, err := client.DownloadImage(
-				ctx, imgToken, filepath.Join(opts.outputDir, dlConfig.Output.ImageDir),
-			)
-			if err != nil {
-				// 图片下载失败时不应该导致整个文档下载失败
-				// 记录警告并继续处理其他图片
-				fmt.Printf("⚠️  图片下载失败: %v\n", err)
+		// 对图片 token 去重，避免重复下载
+		uniqueTokens := make([]string, 0, len(parser.ImgTokens))
+		seen := make(map[string]struct{}, len(parser.ImgTokens))
+		for _, t := range parser.ImgTokens {
+			if _, ok := seen[t]; ok {
 				continue
 			}
-			markdown = strings.Replace(markdown, imgToken, localLink, 1)
-			successCount++
+			seen[t] = struct{}{}
+			uniqueTokens = append(uniqueTokens, t)
 		}
+
+		// 控制单文档内图片下载并发度
+		maxImgConcurrency := 8
+		type result struct {
+			token, link string
+			fromCache   bool
+			err         error
+		}
+		jobs := make(chan string)
+		results := make(chan result, len(uniqueTokens))
+		outImgDir := filepath.Join(opts.outputDir, dlConfig.Output.ImageDir)
+
+		worker := func() {
+			for token := range jobs {
+				// 先查本地缓存，命中则直接返回
+				if matches, _ := filepath.Glob(filepath.Join(outImgDir, token+".*")); len(matches) > 0 {
+					local := fmt.Sprintf("./%s/%s", filepath.Base(outImgDir), filepath.Base(matches[0]))
+					results <- result{token: token, link: local, fromCache: true, err: nil}
+					continue
+				}
+				localLink, err := client.DownloadImage(
+					ctx, token, outImgDir,
+				)
+				results <- result{token: token, link: localLink, fromCache: false, err: err}
+			}
+		}
+		for i := 0; i < maxImgConcurrency; i++ {
+			go worker()
+		}
+		for _, token := range uniqueTokens {
+			jobs <- token
+		}
+		close(jobs)
+
+		// 收集结果并替换链接
+		successCount := 0
+		cacheHitCount := 0
+		failedTokens := 0
+		tokenToLink := make(map[string]string, len(uniqueTokens))
+		for i := 0; i < len(uniqueTokens); i++ {
+			r := <-results
+			if r.err != nil {
+				fmt.Printf("⚠️  图片下载失败: %v\n", r.err)
+				failedTokens++
+				continue
+			}
+			tokenToLink[r.token] = r.link
+			successCount++
+			if r.fromCache {
+				cacheHitCount++
+			}
+		}
+
+		// 一次性替换，避免多次 strings.Replace 带来的重复扫描
 		if successCount > 0 {
-			fmt.Printf("📸 下载了 %d 张图片\n", successCount)
+			for token, link := range tokenToLink {
+				markdown = strings.ReplaceAll(markdown, token, link)
+			}
+			downloaded := successCount - cacheHitCount
+			if failedTokens > 0 {
+				fmt.Printf("📸 图片处理: 命中缓存 %d, 新下载 %d, 失败 %d\n", cacheHitCount, downloaded, failedTokens)
+			} else {
+				fmt.Printf("📸 图片处理: 命中缓存 %d, 新下载 %d\n", cacheHitCount, downloaded)
+			}
+			if dlStats != nil {
+				dlStats.AddImages(len(uniqueTokens), downloaded)
+			}
 		}
 	}
 
@@ -171,11 +287,6 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	}
 
 	// 写入markdown文件
-	mdName := fmt.Sprintf("%s.md", docToken)
-	if dlConfig.Output.TitleAsFilename {
-		mdName = fmt.Sprintf("%s.md", utils.SanitizeFileName(title))
-	}
-	outputPath := filepath.Join(opts.outputDir, mdName)
 
 	// 检查是否需要跳过重复文件
 	if !opts.forceDownload && shouldSkipFile(outputPath, result, opts.skipDuplicate) {
@@ -186,7 +297,12 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	if err = os.WriteFile(outputPath, []byte(result), 0o644); err != nil {
 		return err
 	}
+	// 写入最新 RevisionID 以便下次快速跳过
+	_ = os.WriteFile(outputPath+".rev", []byte(fmt.Sprint(docx.RevisionID)), 0o644)
 	fmt.Printf("✅ %s\n", title)
+	if dlStats != nil {
+		dlStats.AddDocNew()
+	}
 
 	return nil
 }
@@ -397,6 +513,9 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 	}
 
 	fmt.Printf("📚 找到 %d 个子文档\n", len(allNodes))
+	// 初始化统计器
+	dlStats = &DownloadStats{}
+	dlStats.SetTotalDocs(len(allNodes))
 
 	// 创建目录结构映射：nodeToken -> 相对路径
 	pathMap := make(map[string]string)
@@ -487,7 +606,14 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 		}
 	}
 
-	fmt.Printf("🎉 完成！成功下载了 %d 个文档\n", len(allNodes))
+	// 统计汇总输出
+	totalDocs, docsNew, totalImages, imagesNew := dlStats.Snapshot()
+	changes := docsNew + imagesNew
+	if changes == 0 {
+		fmt.Printf("🎉 完成！共 %d 个文档、%d 张图片，全部已缓存、无更新\n", totalDocs, totalImages)
+	} else {
+		fmt.Printf("🎉 完成！共 %d 个文档、%d 张图片，其中新增文档 %d、新增图片 %d，共 %d 处变更\n", totalDocs, totalImages, docsNew, imagesNew, changes)
+	}
 	return nil
 }
 

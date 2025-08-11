@@ -29,6 +29,12 @@ func NewClient(appID, appSecret string) *Client {
 }
 
 func (c *Client) DownloadImage(ctx context.Context, imgToken, outDir string) (string, error) {
+	// 如果本地已经存在以 imgToken 命名的图片文件（任意扩展名），则直接复用，跳过网络下载
+	if existingPath, ok := findExistingLocalImage(outDir, imgToken); ok {
+		relativePath := fmt.Sprintf("./%s/%s", filepath.Base(outDir), filepath.Base(existingPath))
+		return relativePath, nil
+	}
+
 	resp, _, err := c.larkClient.Drive.DownloadDriveMedia(ctx, &lark.DownloadDriveMediaReq{
 		FileToken: imgToken,
 	})
@@ -71,6 +77,19 @@ func (c *Client) DownloadImage(ctx context.Context, imgToken, outDir string) (st
 	return relativePath, nil
 }
 
+// findExistingLocalImage 在 outDir 内查找以 imgToken 命名、任意扩展名的已存在图片文件
+// 命中则返回绝对路径与 true，否则返回空字符串与 false
+func findExistingLocalImage(outDir, imgToken string) (string, bool) {
+	// 模式如: /abs/outDir/<imgToken>.*
+	pattern := filepath.Join(outDir, imgToken+".*")
+	matches, _ := filepath.Glob(pattern)
+	if len(matches) == 0 {
+		return "", false
+	}
+	// 取第一个匹配项（通常只会存在一个）
+	return matches[0], true
+}
+
 func (c *Client) DownloadImageRaw(ctx context.Context, imgToken, imgDir string) (string, []byte, error) {
 	resp, _, err := c.larkClient.Drive.DownloadDriveMedia(ctx, &lark.DownloadDriveMediaReq{
 		FileToken: imgToken,
@@ -83,6 +102,22 @@ func (c *Client) DownloadImageRaw(ctx context.Context, imgToken, imgDir string) 
 	buf := new(bytes.Buffer)
 	buf.ReadFrom(resp.File)
 	return filename, buf.Bytes(), nil
+}
+
+// GetDocxDocumentMeta 仅获取文档的基本信息（不拉取块列表），用于快速判断修订版本
+func (c *Client) GetDocxDocumentMeta(ctx context.Context, docToken string) (*lark.DocxDocument, error) {
+	resp, _, err := c.larkClient.Drive.GetDocxDocument(ctx, &lark.GetDocxDocumentReq{
+		DocumentID: docToken,
+	})
+	if err != nil {
+		return nil, err
+	}
+	docx := &lark.DocxDocument{
+		DocumentID: resp.Document.DocumentID,
+		RevisionID: resp.Document.RevisionID,
+		Title:      resp.Document.Title,
+	}
+	return docx, nil
 }
 
 func (c *Client) GetDocxContent(ctx context.Context, docToken string) (*lark.DocxDocument, []*lark.DocxBlock, error) {
@@ -212,6 +247,7 @@ func (c *Client) GetChildNodes(ctx context.Context, spaceID, parentNodeToken str
 	pageToken := ""
 
 	for {
+		// 按飞书 API 限制，page_size 取值范围为 [1-50]
 		pageSize := int64(50)
 		req := &lark.GetWikiNodeListReq{
 			SpaceID:         spaceID,
