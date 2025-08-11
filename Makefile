@@ -64,12 +64,39 @@ ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
 	upx -9 $(BIN_DIR)/feishu2md-linux-arm64
 endif
 
+.PHONY: build-linux-386
+build-linux-386:
+	@mkdir -p $(BIN_DIR)
+	GOOS=linux GOARCH=386 CGO_ENABLED=0 \
+		go build -ldflags="$(LDFLAGS)" \
+		-o $(BIN_DIR)/feishu2md-linux-386 ./cmd
+ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
+	upx -9 $(BIN_DIR)/feishu2md-linux-386
+endif
+
+.PHONY: build-linux-arm
+build-linux-arm:
+	@mkdir -p $(BIN_DIR)
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
+		go build -ldflags="$(LDFLAGS)" \
+		-o $(BIN_DIR)/feishu2md-linux-armv7 ./cmd
+ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
+	upx -9 $(BIN_DIR)/feishu2md-linux-armv7
+endif
+
 .PHONY: build-darwin-arm64
 build-darwin-arm64:
 	@mkdir -p $(BIN_DIR)
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
 		go build -ldflags="$(LDFLAGS)" \
 		-o $(BIN_DIR)/feishu2md-darwin-arm64 ./cmd
+
+.PHONY: build-darwin-amd64
+build-darwin-amd64:
+	@mkdir -p $(BIN_DIR)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
+		go build -ldflags="$(LDFLAGS)" \
+		-o $(BIN_DIR)/feishu2md-darwin-amd64 ./cmd
 
 .PHONY: build-windows-amd64
 build-windows-amd64:
@@ -81,8 +108,28 @@ ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
 	upx -9 $(BIN_DIR)/feishu2md-windows-amd64.exe || true
 endif
 
+.PHONY: build-windows-386
+build-windows-386:
+	@mkdir -p $(BIN_DIR)
+	GOOS=windows GOARCH=386 CGO_ENABLED=0 \
+		go build -ldflags="$(LDFLAGS)" \
+		-o $(BIN_DIR)/feishu2md-windows-386.exe ./cmd
+ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
+	upx -9 $(BIN_DIR)/feishu2md-windows-386.exe || true
+endif
+
+.PHONY: build-windows-arm64
+build-windows-arm64:
+	@mkdir -p $(BIN_DIR)
+	GOOS=windows GOARCH=arm64 CGO_ENABLED=0 \
+		go build -ldflags="$(LDFLAGS)" \
+		-o $(BIN_DIR)/feishu2md-windows-arm64.exe ./cmd
+ifneq ($(and $(COMPRESS),$(HAS_UPX)),)
+	upx -9 $(BIN_DIR)/feishu2md-windows-arm64.exe || true
+endif
+
 .PHONY: build-bin
-build-bin: build-linux-amd64 build-linux-arm64 build-darwin-arm64 build-windows-amd64
+build-bin: build-linux-amd64 build-linux-arm64 build-linux-386 build-linux-arm build-darwin-arm64 build-darwin-amd64 build-windows-amd64 build-windows-386 build-windows-arm64
 
 .PHONY: build-all
 build-all: build build-bin
@@ -98,15 +145,40 @@ package-linux-arm64: build-linux-arm64
 	@mkdir -p $(BIN_DIR)
 	tar -C $(BIN_DIR) -czf $(BIN_DIR)/feishu2md_$(VERSION)_linux-arm64.tar.gz feishu2md-linux-arm64
 
+.PHONY: package-linux-386
+package-linux-386: build-linux-386
+	@mkdir -p $(BIN_DIR)
+	tar -C $(BIN_DIR) -czf $(BIN_DIR)/feishu2md_$(VERSION)_linux-386.tar.gz feishu2md-linux-386
+
+.PHONY: package-linux-arm
+package-linux-arm: build-linux-arm
+	@mkdir -p $(BIN_DIR)
+	tar -C $(BIN_DIR) -czf $(BIN_DIR)/feishu2md_$(VERSION)_linux-armv7.tar.gz feishu2md-linux-armv7
+
 .PHONY: package-darwin-arm64
 package-darwin-arm64: build-darwin-arm64
 	@mkdir -p $(BIN_DIR)
 	tar -C $(BIN_DIR) -czf $(BIN_DIR)/feishu2md_$(VERSION)_darwin-arm64.tar.gz feishu2md-darwin-arm64
+
+.PHONY: package-darwin-amd64
+package-darwin-amd64: build-darwin-amd64
+	@mkdir -p $(BIN_DIR)
+	tar -C $(BIN_DIR) -czf $(BIN_DIR)/feishu2md_$(VERSION)_darwin-amd64.tar.gz feishu2md-darwin-amd64
 
 .PHONY: package-windows-amd64
 package-windows-amd64: build-windows-amd64
 	@mkdir -p $(BIN_DIR)
 	zip -j $(BIN_DIR)/feishu2md_$(VERSION)_windows-amd64.zip $(BIN_DIR)/feishu2md-windows-amd64.exe >/dev/null
 
+.PHONY: package-windows-386
+package-windows-386: build-windows-386
+	@mkdir -p $(BIN_DIR)
+	zip -j $(BIN_DIR)/feishu2md_$(VERSION)_windows-386.zip $(BIN_DIR)/feishu2md-windows-386.exe >/dev/null
+
+.PHONY: package-windows-arm64
+package-windows-arm64: build-windows-arm64
+	@mkdir -p $(BIN_DIR)
+	zip -j $(BIN_DIR)/feishu2md_$(VERSION)_windows-arm64.zip $(BIN_DIR)/feishu2md-windows-arm64.exe >/dev/null
+
 .PHONY: package-all
-package-all: package-linux-amd64 package-linux-arm64 package-darwin-arm64 package-windows-amd64
+package-all: package-linux-amd64 package-linux-arm64 package-linux-386 package-linux-arm package-darwin-arm64 package-darwin-amd64 package-windows-amd64 package-windows-386 package-windows-arm64
