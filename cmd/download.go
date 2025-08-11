@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -28,6 +29,7 @@ type DownloadOpts struct {
 	forceDownload bool   // 是否强制下载
 	spaceID       string // 知识库空间ID（用于检查子节点）
 	nodeToken     string // 当前节点令牌（用于检查子节点）
+	relDir        string // 相对根输出目录的路径（仅 wiki-tree 用于日志排序）
 }
 
 // calculateMD5 计算字符串的MD5哈希值
@@ -104,6 +106,39 @@ func (s *DownloadStats) Snapshot() (totalDocs, docsNew, totalImages, imagesNew i
 // dlStats 在 wiki-tree 模式下初始化用于统计；其他模式保持 nil
 var dlStats *DownloadStats
 
+// DocLog 记录单篇文档的处理情况
+type DocLog struct {
+	Path     string
+	Skipped  bool
+	Reason   string
+	ImgCache int
+	ImgNew   int
+	DocNew   bool // 仅当首次创建文件时记为 true
+}
+
+type LogCollector struct {
+	mu   sync.Mutex
+	logs []DocLog
+}
+
+func (lc *LogCollector) Add(l DocLog) {
+	lc.mu.Lock()
+	lc.logs = append(lc.logs, l)
+	lc.mu.Unlock()
+}
+
+func (lc *LogCollector) SortedByPath() []DocLog {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	out := make([]DocLog, len(lc.logs))
+	copy(out, lc.logs)
+	// 简单按 Path 字典序排序，接近文档层级顺序
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+var logCollector = &LogCollector{}
+
 // downloadDocument 下载单个飞书文档并转换为Markdown
 // 它处理文档验证、内容检索、图片处理和文件输出
 func downloadDocument(ctx context.Context, client *core.Client, url string, opts *DownloadOpts) error {
@@ -155,6 +190,14 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 		if b, err := os.ReadFile(revPath); err == nil {
 			if strings.TrimSpace(string(b)) == fmt.Sprint(meta.RevisionID) {
 				fmt.Printf("⏭️  修订未变化，跳过: %s\n", meta.Title)
+				if dlStats != nil {
+					// 记录跳过日志
+					pathForLog := mdName
+					if opts.relDir != "" {
+						pathForLog = filepath.Join(opts.relDir, mdName)
+					}
+					logCollector.Add(DocLog{Path: pathForLog, Skipped: true, Reason: "未变化"})
+				}
 				return nil
 			}
 		}
@@ -240,12 +283,18 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 			}
 			downloaded := successCount - cacheHitCount
 			if failedTokens > 0 {
-				fmt.Printf("📸 图片处理: 命中缓存 %d, 新下载 %d, 失败 %d\n", cacheHitCount, downloaded, failedTokens)
+				fmt.Printf("   ├─ 图片: 命中缓存 %d, 新下载 %d, 失败 %d\n", cacheHitCount, downloaded, failedTokens)
 			} else {
-				fmt.Printf("📸 图片处理: 命中缓存 %d, 新下载 %d\n", cacheHitCount, downloaded)
+				fmt.Printf("   ├─ 图片: 命中缓存 %d, 新下载 %d\n", cacheHitCount, downloaded)
 			}
 			if dlStats != nil {
 				dlStats.AddImages(len(uniqueTokens), downloaded)
+				// 把图片统计合并到当前文档日志（最后汇总输出）
+				pathForLog := mdName
+				if opts.relDir != "" {
+					pathForLog = filepath.Join(opts.relDir, mdName)
+				}
+				logCollector.Add(DocLog{Path: pathForLog, ImgCache: cacheHitCount, ImgNew: downloaded})
 			}
 		}
 	}
@@ -302,6 +351,12 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	fmt.Printf("✅ %s\n", title)
 	if dlStats != nil {
 		dlStats.AddDocNew()
+		// 记录文档新增日志（图片统计在前面 AddImages 已做累加）
+		pathForLog := mdName
+		if opts.relDir != "" {
+			pathForLog = filepath.Join(opts.relDir, mdName)
+		}
+		logCollector.Add(DocLog{Path: pathForLog, DocNew: true})
 	}
 
 	return nil
@@ -583,6 +638,7 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 					forceDownload: opts.forceDownload,
 					spaceID:       spaceID,
 					nodeToken:     n.NodeToken,
+					relDir:        nodePath,
 				}
 
 				// 移除冗余的下载路径输出
@@ -606,7 +662,27 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 		}
 	}
 
-	// 统计汇总输出
+	// 统计汇总输出（整洁格式）
+	fmt.Println()
+	fmt.Println("📦 处理结果：")
+	for _, l := range logCollector.SortedByPath() {
+		status := "缓存"
+		if l.DocNew {
+			status = "新增"
+		} else if l.Skipped {
+			status = "跳过"
+		}
+		if l.Reason != "" {
+			status += " (" + l.Reason + ")"
+		}
+		fmt.Printf("- %s  [%s]", l.Path, status)
+		if l.ImgCache > 0 || l.ImgNew > 0 {
+			fmt.Printf("  | 图片: +%d / 命中%d", l.ImgNew, l.ImgCache)
+		}
+		fmt.Println()
+	}
+
+	// 汇总
 	totalDocs, docsNew, totalImages, imagesNew := dlStats.Snapshot()
 	changes := docsNew + imagesNew
 	if changes == 0 {
