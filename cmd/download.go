@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/88250/lute"
 	"github.com/Wsine/feishu2md/core"
@@ -304,6 +305,52 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 		l.RenderOptions.AutoSpace = true
 	})
 	result := engine.FormatStr("md", markdown)
+
+	// 构建 frontmatter（MDX/YAML）
+	// 标题
+	fmTitle := meta.Title
+	// 获取时间元数据
+	var fmDate, fmUpdated string
+	if createdAt, updatedAt, terr := client.GetDocxTimes(ctx, docToken); terr == nil {
+		// 固定东八区 +08:00
+		loc, _ := time.LoadLocation("Asia/Shanghai")
+		if createdAt != nil {
+			fmDate = createdAt.In(loc).Format("2006-01-02T15:04:05-07:00")
+		}
+		if updatedAt != nil {
+			fmUpdated = updatedAt.In(loc).Format("2006-01-02T15:04:05-07:00")
+		}
+	}
+	// 兜底：若时间缺失，使用当前时间
+	if fmDate == "" || fmUpdated == "" {
+		now := time.Now().In(time.FixedZone("CST-8", 8*3600))
+		if fmDate == "" {
+			fmDate = now.Format("2006-01-02T15:04:05-07:00")
+		}
+		if fmUpdated == "" {
+			fmUpdated = now.Format("2006-01-02T15:04:05-07:00")
+		}
+	}
+	// YAML 转义标题中的冒号等
+	escapeYAML := func(s string) string {
+		// 简单处理：若包含特殊字符，则使用双引号并转义
+		special := ":-#{}[],&*?|\"<>=!%@`) \\" // 包含引号、反斜线与常见特殊字符
+		if strings.ContainsAny(s, special) {
+			// 转义双引号与反斜线
+			s = strings.ReplaceAll(s, "\\", "\\\\")
+			s = strings.ReplaceAll(s, "\"", "\\\"")
+			return "\"" + s + "\""
+		}
+		return s
+	}
+	fm := "---\n" +
+		"title: " + escapeYAML(fmTitle) + "\n" +
+		"date: " + fmDate + "\n" +
+		"updated: " + fmUpdated + "\n" +
+		"---\n\n"
+
+	// 合并 frontmatter 与正文
+	result = fm + result
 
 	// 处理输出目录和名称
 	if _, err := os.Stat(opts.outputDir); os.IsNotExist(err) {

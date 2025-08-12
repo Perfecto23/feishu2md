@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -176,6 +177,45 @@ func (c *Client) GetDocxContent(ctx context.Context, docToken string) (*lark.Doc
 		}
 	}
 	return docx, blocks, nil
+}
+
+// GetDocxTimes 获取 docx 文档的创建时间与最近修改时间
+// 返回值为指针，若对应字段不可用则为 nil
+func (c *Client) GetDocxTimes(ctx context.Context, docToken string) (createdAt *time.Time, updatedAt *time.Time, err error) {
+	resp, _, err := c.larkClient.Drive.GetDriveFileMeta(ctx, &lark.GetDriveFileMetaReq{
+		RequestDocs: []*lark.GetDriveFileMetaReqRequestDocs{
+			{DocToken: docToken, DocType: "docx"},
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp == nil || len(resp.Metas) == 0 || resp.Metas[0] == nil {
+		return nil, nil, fmt.Errorf("未获取到文档元数据")
+	}
+	meta := resp.Metas[0]
+
+	parseUnixString := func(s string) (*time.Time, error) {
+		if strings.TrimSpace(s) == "" {
+			return nil, nil
+		}
+		// 兼容秒/毫秒时间戳
+		v, perr := strconv.ParseInt(s, 10, 64)
+		if perr != nil {
+			return nil, perr
+		}
+		var t time.Time
+		if v > 1_000_000_000_000 { // 毫秒
+			t = time.Unix(0, v*int64(time.Millisecond))
+		} else { // 秒
+			t = time.Unix(v, 0)
+		}
+		return &t, nil
+	}
+
+	ctime, _ := parseUnixString(meta.CreateTime)
+	mtime, _ := parseUnixString(meta.LatestModifyTime)
+	return ctime, mtime, nil
 }
 
 func (c *Client) GetWikiNodeInfo(ctx context.Context, token string) (*lark.GetWikiNodeRespNode, error) {
