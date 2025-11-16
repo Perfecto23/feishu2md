@@ -15,8 +15,9 @@ import (
 	"time"
 
 	"github.com/88250/lute"
-	"github.com/Wsine/feishu2md/core"
-	"github.com/Wsine/feishu2md/utils"
+	"github.com/Perfecto23/feishu2md/core"
+	"github.com/Perfecto23/feishu2md/imgbed"
+	"github.com/Perfecto23/feishu2md/utils"
 	"github.com/chyroc/lark"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
@@ -31,6 +32,7 @@ type DownloadOpts struct {
 	spaceID       string // 知识库空间ID（用于检查子节点）
 	nodeToken     string // 当前节点令牌（用于检查子节点）
 	relDir        string // 相对根输出目录的路径（仅 wiki-tree 用于日志排序）
+	tags          []string
 }
 
 // calculateMD5 计算字符串的MD5哈希值
@@ -140,6 +142,19 @@ func (lc *LogCollector) SortedByPath() []DocLog {
 
 var logCollector = &LogCollector{}
 
+func deriveTagsFromPath(relPath string) []string {
+	cleanPath := filepath.Clean(relPath)
+	if cleanPath == "." || cleanPath == string(os.PathSeparator) || cleanPath == "" {
+		return nil
+	}
+	// 只取直接父目录作为 tag
+	parentDir := filepath.Base(cleanPath)
+	if parentDir == "" || parentDir == "." {
+		return nil
+	}
+	return []string{parentDir}
+}
+
 // downloadDocument 下载单个飞书文档并转换为Markdown
 // 它处理文档验证、内容检索、图片处理和文件输出
 func downloadDocument(ctx context.Context, client *core.Client, url string, opts *DownloadOpts) error {
@@ -186,23 +201,6 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 		mdName = fmt.Sprintf("%s.md", utils.SanitizeFileName(meta.Title))
 	}
 	outputPath := filepath.Join(opts.outputDir, mdName)
-	revPath := outputPath + ".rev"
-	if !opts.forceDownload && opts.skipDuplicate && fileExists(outputPath) && fileExists(revPath) {
-		if b, err := os.ReadFile(revPath); err == nil {
-			if strings.TrimSpace(string(b)) == fmt.Sprint(meta.RevisionID) {
-				fmt.Printf("⏭️  修订未变化，跳过: %s\n", meta.Title)
-				if dlStats != nil {
-					// 记录跳过日志
-					pathForLog := mdName
-					if opts.relDir != "" {
-						pathForLog = filepath.Join(opts.relDir, mdName)
-					}
-					logCollector.Add(DocLog{Path: pathForLog, Skipped: true, Reason: "未变化"})
-				}
-				return nil
-			}
-		}
-	}
 
 	// 未命中快速跳过，拉取块内容
 	docx, blocks, err := client.GetDocxContent(ctx, docToken)
@@ -225,11 +223,23 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 			uniqueTokens = append(uniqueTokens, t)
 		}
 
+		// 初始化图床上传器（如果启用了图床）
+		var uploader *imgbed.Uploader
+		if imgbed.IsEnabled(&dlConfig.ImageBed) {
+			var err error
+			uploader, err = imgbed.NewUploader(&dlConfig.ImageBed)
+			if err != nil {
+				fmt.Printf("⚠️  创建图床上传器失败: %v\n", err)
+				uploader = nil
+			}
+		}
+
 		// 控制单文档内图片下载并发度
 		maxImgConcurrency := 8
 		type result struct {
 			token, link string
-			fromCache   bool
+			fromImgbed  bool // 是否从图床直接获取
+			needUpload  bool // 是否需要上传到图床
 			err         error
 		}
 		jobs := make(chan string)
@@ -238,16 +248,35 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 
 		worker := func() {
 			for token := range jobs {
-				// 先查本地缓存，命中则直接返回
-				if matches, _ := filepath.Glob(filepath.Join(outImgDir, token+".*")); len(matches) > 0 {
-					local := fmt.Sprintf("./%s/%s", filepath.Base(outImgDir), filepath.Base(matches[0]))
-					results <- result{token: token, link: local, fromCache: true, err: nil}
+				// 1. 先下载到本地（需要知道扩展名才能检查图床）
+				localLink, err := client.DownloadImage(ctx, token, outImgDir)
+				if err != nil {
+					results <- result{token: token, link: "", fromImgbed: false, needUpload: false, err: err}
 					continue
 				}
-				localLink, err := client.DownloadImage(
-					ctx, token, outImgDir,
-				)
-				results <- result{token: token, link: localLink, fromCache: false, err: err}
+
+				// 2. 如果启用了图床，检查图床是否已存在
+				if uploader != nil {
+					// 提取文件名（包含扩展名）
+					filename := filepath.Base(localLink)
+					platform := uploader.GetPlatform()
+
+					// 检查图床是否存在
+					exists, imgbedURL := platform.CheckExists(ctx, filename)
+					if exists {
+						// 图床已存在，删除本地文件，直接使用图床URL
+						fullPath := filepath.Join(opts.outputDir, localLink)
+						os.Remove(fullPath)
+						results <- result{token: token, link: imgbedURL, fromImgbed: true, needUpload: false, err: nil}
+						continue
+					}
+
+					// 图床不存在，标记需要上传
+					results <- result{token: token, link: localLink, fromImgbed: false, needUpload: true, err: nil}
+				} else {
+					// 未启用图床，直接使用本地路径
+					results <- result{token: token, link: localLink, fromImgbed: false, needUpload: false, err: nil}
+				}
 			}
 		}
 		for i := 0; i < maxImgConcurrency; i++ {
@@ -260,9 +289,10 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 
 		// 收集结果并替换链接
 		successCount := 0
-		cacheHitCount := 0
+		imgbedHitCount := 0
 		failedTokens := 0
 		tokenToLink := make(map[string]string, len(uniqueTokens))
+		needUploadImages := make(map[string]string) // 记录需要上传到图床的图片
 		for i := 0; i < len(uniqueTokens); i++ {
 			r := <-results
 			if r.err != nil {
@@ -272,30 +302,75 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 			}
 			tokenToLink[r.token] = r.link
 			successCount++
-			if r.fromCache {
-				cacheHitCount++
+
+			if r.fromImgbed {
+				// 从图床直接获取
+				imgbedHitCount++
+			} else if r.needUpload {
+				// 需要上传到图床
+				needUploadImages[r.token] = r.link
 			}
 		}
 
 		// 一次性替换，避免多次 strings.Replace 带来的重复扫描
 		if successCount > 0 {
+			// 如果有图片需要上传到图床
+			uploadedCount := 0
+			if uploader != nil && len(needUploadImages) > 0 {
+				// 收集需要上传的图片路径
+				localPaths := make([]string, 0, len(needUploadImages))
+				for _, link := range needUploadImages {
+					fullPath := filepath.Join(opts.outputDir, link)
+					localPaths = append(localPaths, fullPath)
+				}
+
+				// 批量上传到图床
+				imgbedURLs := uploader.BatchUploadFromLocal(ctx, localPaths)
+
+				// 替换tokenToLink中的链接为图床URL，并删除已上传的本地文件
+				for token, link := range needUploadImages {
+					fullPath := filepath.Join(opts.outputDir, link)
+					if imgbedURL, ok := imgbedURLs[fullPath]; ok {
+						tokenToLink[token] = imgbedURL
+						uploadedCount++
+
+						// 上传成功后删除本地图片
+						os.Remove(fullPath)
+					}
+				}
+
+				if uploadedCount > 0 {
+					fmt.Printf("   ├─ 图床: 上传 %d 张（跳过 %d 张已存在）\n", uploadedCount, imgbedHitCount)
+				}
+
+				// 尝试删除空的图片目录
+				imgDir := filepath.Join(opts.outputDir, dlConfig.Output.ImageDir)
+				if entries, err := os.ReadDir(imgDir); err == nil && len(entries) == 0 {
+					os.Remove(imgDir)
+				}
+			} else if imgbedHitCount > 0 {
+				// 所有图片都从图床获取
+				fmt.Printf("   ├─ 图床: 跳过 %d 张（已存在）\n", imgbedHitCount)
+			}
+
+			// 替换markdown中的token为最终链接（本地链接或图床链接）
 			for token, link := range tokenToLink {
 				markdown = strings.ReplaceAll(markdown, token, link)
 			}
-			downloaded := successCount - cacheHitCount
+
+			totalImages := successCount + imgbedHitCount
 			if failedTokens > 0 {
-				fmt.Printf("   ├─ 图片: 命中缓存 %d, 新下载 %d, 失败 %d\n", cacheHitCount, downloaded, failedTokens)
-			} else {
-				fmt.Printf("   ├─ 图片: 命中缓存 %d, 新下载 %d\n", cacheHitCount, downloaded)
+				fmt.Printf("   ├─ 图片: 共 %d 张, 失败 %d\n", totalImages, failedTokens)
 			}
 			if dlStats != nil {
+				downloaded := successCount
 				dlStats.AddImages(len(uniqueTokens), downloaded)
 				// 把图片统计合并到当前文档日志（最后汇总输出）
 				pathForLog := mdName
 				if opts.relDir != "" {
 					pathForLog = filepath.Join(opts.relDir, mdName)
 				}
-				logCollector.Add(DocLog{Path: pathForLog, ImgCache: cacheHitCount, ImgNew: downloaded})
+				logCollector.Add(DocLog{Path: pathForLog, ImgCache: imgbedHitCount, ImgNew: downloaded})
 			}
 		}
 	}
@@ -343,14 +418,24 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 		}
 		return s
 	}
-	fm := "---\n" +
-		"title: " + escapeYAML(fmTitle) + "\n" +
-		"date: " + fmDate + "\n" +
-		"updated: " + fmUpdated + "\n" +
-		"---\n\n"
+	var fmBuilder strings.Builder
+	fmBuilder.WriteString("---\n")
+	fmBuilder.WriteString("title: " + escapeYAML(fmTitle) + "\n")
+	fmBuilder.WriteString("date: " + fmDate + "\n")
+	fmBuilder.WriteString("updated: " + fmUpdated + "\n")
+	if len(opts.tags) > 0 {
+		fmBuilder.WriteString("tags:\n")
+		for _, tag := range opts.tags {
+			if strings.TrimSpace(tag) == "" {
+				continue
+			}
+			fmBuilder.WriteString("  - " + escapeYAML(tag) + "\n")
+		}
+	}
+	fmBuilder.WriteString("---\n\n")
 
 	// 合并 frontmatter 与正文
-	result = fm + result
+	result = fmBuilder.String() + result
 
 	// 处理输出目录和名称
 	if _, err := os.Stat(opts.outputDir); os.IsNotExist(err) {
@@ -393,8 +478,6 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	if err = os.WriteFile(outputPath, []byte(result), 0o644); err != nil {
 		return err
 	}
-	// 写入最新 RevisionID 以便下次快速跳过
-	_ = os.WriteFile(outputPath+".rev", []byte(fmt.Sprint(docx.RevisionID)), 0o644)
 	fmt.Printf("✅ %s\n", title)
 	if dlStats != nil {
 		dlStats.AddDocNew()
@@ -438,12 +521,13 @@ func downloadDocuments(ctx context.Context, client *core.Client, url string, opt
 			nodeToken:     opts.nodeToken,
 		}
 		for _, file := range files {
-			if file.Type == "folder" {
+			switch file.Type {
+			case "folder":
 				_folderPath := filepath.Join(folderPath, file.Name)
 				if err := processFolder(ctx, _folderPath, file.Token); err != nil {
 					return err
 				}
-			} else if file.Type == "docx" {
+			case "docx":
 				// 并发下载文档
 				wg.Add(1)
 				go func(_url string) {
@@ -574,9 +658,9 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 
 	if spaceID == "" {
 		return fmt.Errorf("无法获取知识库spaceID。请通过以下方式提供:\n" +
-			"  1. 命令行参数: --space-id <id>\n" +
-			"  2. 环境变量: FEISHU_SPACE_ID\n" +
-			"  3. 使用知识库设置页面URL")
+			"  1. 环境变量: FEISHU_SPACE_ID (在 .env 文件中配置)\n" +
+			"  2. 使用知识库设置页面URL\n\n" +
+			"提示: 运行 'feishu2md init' 创建配置文件模板")
 	}
 
 	// 如果还没有获取URL前缀，则从URL中提取
@@ -686,6 +770,7 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 					spaceID:       spaceID,
 					nodeToken:     n.NodeToken,
 					relDir:        nodePath,
+					tags:          deriveTagsFromPath(nodePath),
 				}
 
 				// 移除冗余的下载路径输出
@@ -742,10 +827,16 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 
 // createCommonOpts 从CLI上下文创建通用的下载选项
 func createCommonOpts(cliCtx *cli.Context) (*DownloadOpts, *core.Config, error) {
+	// 加载配置文件（如果指定）
+	configPath := cliCtx.String("config")
+	if configPath != "" {
+		if err := core.LoadEnvFileIfExists(configPath); err != nil {
+			return nil, nil, fmt.Errorf("加载配置文件失败: %w", err)
+		}
+	}
+
 	// 提取CLI标志
-	appId := cliCtx.String("app-id")
-	appSecret := cliCtx.String("app-secret")
-	spaceId := cliCtx.String("space")
+	spaceId := os.Getenv("FEISHU_SPACE_ID")
 	outputDir := cliCtx.String("out")
 	titleAsFilename := cliCtx.Bool("title-name")
 	imageDir := cliCtx.String("img-dir")
@@ -756,7 +847,7 @@ func createCommonOpts(cliCtx *cli.Context) (*DownloadOpts, *core.Config, error) 
 	dumpJSON := cliCtx.Bool("json")
 
 	// 加载配置
-	config, err := core.LoadConfig(appId, appSecret)
+	config, err := core.LoadConfig("", "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -764,8 +855,9 @@ func createCommonOpts(cliCtx *cli.Context) (*DownloadOpts, *core.Config, error) 
 	// 验证凭据
 	if config.Feishu.AppId == "" || config.Feishu.AppSecret == "" {
 		return nil, nil, cli.Exit("需要应用ID和应用密钥。请通过以下方式设置:\n"+
-			"  1. 命令行: --app-id <id> --app-secret <secret>\n"+
-			"  2. 环境变量: FEISHU_APP_ID 和 FEISHU_APP_SECRET", 1)
+			"  1. 环境变量: FEISHU_APP_ID 和 FEISHU_APP_SECRET\n"+
+			"  2. 配置文件: 使用 --config 指定配置文件路径\n"+
+			"  3. 运行 'feishu2md init' 创建配置文件模板", 1)
 	}
 
 	// 使用CLI标志覆盖配置
@@ -829,6 +921,34 @@ func handleWikiDownload(cliCtx *cli.Context, url string) error {
 	ctx := context.Background()
 
 	return downloadWiki(ctx, client, url, opts)
+}
+
+// handleWikiTreeCommand 处理知识库子文档下载命令
+func handleWikiTreeCommand(cliCtx *cli.Context) error {
+	// 先加载配置文件
+	configPath := cliCtx.String("config")
+	if configPath != "" {
+		if err := core.LoadEnvFileIfExists(configPath); err != nil {
+			return fmt.Errorf("加载配置文件失败: %w", err)
+		}
+	}
+
+	// 获取 URL：优先使用命令行参数，其次使用环境变量
+	var url string
+	if cliCtx.NArg() > 0 {
+		url = cliCtx.Args().First()
+	} else {
+		url = os.Getenv("FEISHU_FOLDER_TOKEN")
+	}
+
+	if url == "" {
+		return cli.Exit("错误: 请指定知识库文档URL\n\n"+
+			"方式一: feishu2md wiki-tree <URL>\n"+
+			"方式二: 在配置文件中设置 FEISHU_FOLDER_TOKEN\n\n"+
+			"提示: 还需要在配置文件中设置 FEISHU_SPACE_ID", 1)
+	}
+
+	return handleWikiTreeDownload(cliCtx, url)
 }
 
 // handleWikiTreeDownload 处理知识库子文档下载

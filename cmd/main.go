@@ -26,27 +26,16 @@ func main() {
 			"  feishu2md document https://example.feishu.cn/docx/xxx\n" +
 			"  feishu2md folder https://example.feishu.cn/drive/folder/xxx\n" +
 			"  feishu2md wiki https://example.feishu.cn/wiki/space/xxx\n" +
-			"  feishu2md wiki-tree https://example.feishu.cn/wiki/xxx --space your_space_id",
+			"  feishu2md wiki-tree https://example.feishu.cn/wiki/xxx",
 		// 可与任何命令一起使用或作为独立选项的全局标志
 		// 全局标志，适用于所有子命令
 		Flags: []cli.Flag{
-			// === 认证配置 ===
+			// === 配置文件 ===
 			&cli.StringFlag{
-				Name:    "app-id",
-				Aliases: []string{"id"},
-				Usage:   "飞书应用ID",
-				EnvVars: []string{"FEISHU_APP_ID"},
-			},
-			&cli.StringFlag{
-				Name:    "app-secret",
-				Aliases: []string{"secret"},
-				Usage:   "飞书应用密钥",
-				EnvVars: []string{"FEISHU_APP_SECRET"},
-			},
-			&cli.StringFlag{
-				Name:    "space",
-				Usage:   "知识库空间ID",
-				EnvVars: []string{"FEISHU_SPACE_ID"},
+				Name:    "config",
+				Aliases: []string{"c"},
+				Usage:   "指定配置文件路径",
+				Value:   ".env",
 			},
 
 			// === 输出配置 ===
@@ -113,6 +102,28 @@ func main() {
 			return handleDownloadCommand(ctx, url)
 		},
 		Commands: []*cli.Command{
+			// 初始化配置文件
+			{
+				Name:    "init",
+				Aliases: []string{"i"},
+				Usage:   "创建环境变量配置文件",
+				Description: "在当前目录创建 .env 示例文件，包含所有配置项说明。\n\n" +
+					"配置项包括:\n" +
+					"  - 飞书API认证信息\n" +
+					"  - 图床配置（阿里云OSS/腾讯云COS）\n\n" +
+					"示例:\n" +
+					"  feishu2md init\n" +
+					"  feishu2md init --force  # 强制覆盖已存在的文件",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name:    "force",
+						Aliases: []string{"f"},
+						Usage:   "强制覆盖已存在的配置文件",
+					},
+				},
+				Action: handleInitCommand,
+			},
+
 			// 单个文档下载
 			{
 				Name:      "document",
@@ -191,10 +202,11 @@ func main() {
 				Name:      "wiki-tree",
 				Aliases:   []string{"wt", "children"},
 				Usage:     "下载知识库文档的所有子文档",
-				ArgsUsage: "<知识库文档URL>",
+				ArgsUsage: "[知识库文档URL]",
 				Description: "下载指定知识库文档下的所有子文档，保持层级结构。\n\n" +
 					"要求:\n" +
-					"  需要通过 --space 或环境变量 FEISHU_SPACE_ID 指定知识库空间ID\n\n" +
+					"  需要在配置文件中设置 FEISHU_SPACE_ID\n" +
+					"  文档 URL 可以通过命令行参数或 FEISHU_FOLDER_TOKEN 环境变量提供\n\n" +
 					"支持的URL格式:\n" +
 					"  - https://example.feishu.cn/wiki/xxx (知识库文档)\n\n" +
 					"特性:\n" +
@@ -203,15 +215,9 @@ func main() {
 					"  - 智能跳过有子节点的文档\n" +
 					"  - 支持并发下载\n\n" +
 					"示例:\n" +
-					"  feishu2md wiki-tree https://example.feishu.cn/wiki/abc123 --space space_456\n" +
-					"  FEISHU_SPACE_ID=space_456 feishu2md wt https://example.feishu.cn/wiki/abc123",
-				Action: func(ctx *cli.Context) error {
-					if ctx.NArg() == 0 {
-						return cli.Exit("错误: 请指定知识库文档URL\n\n示例: feishu2md wiki-tree https://example.feishu.cn/wiki/xxx --space your_space_id", 1)
-					}
-					url := ctx.Args().First()
-					return handleWikiTreeDownload(ctx, url)
-				},
+					"  feishu2md wiki-tree https://example.feishu.cn/wiki/abc123\n" +
+					"  feishu2md wiki-tree  # 使用 .env 中配置的 FEISHU_FOLDER_TOKEN",
+				Action: handleWikiTreeCommand,
 			},
 
 			// 兼容性命令 - 保持向后兼容
