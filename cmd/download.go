@@ -33,6 +33,7 @@ type DownloadOpts struct {
 	nodeToken     string // 当前节点令牌（用于检查子节点）
 	relDir        string // 相对根输出目录的路径（仅 wiki-tree 用于日志排序）
 	tags          []string
+	category      string // 文档分类（从路径第一层目录推导）
 }
 
 // calculateMD5 计算字符串的MD5哈希值
@@ -153,6 +154,23 @@ func deriveTagsFromPath(relPath string) []string {
 		return nil
 	}
 	return []string{parentDir}
+}
+
+// deriveCategoryFromPath 从相对路径推导分类
+// 返回路径的最后一层目录作为 category（与 tag 保持一致）
+// 如：wiki-tree 下文档 docs/a/b/c.md 其 relPath 为 "docs/a/b"
+// 返回 "b"（最具体的分类）
+func deriveCategoryFromPath(relPath string) string {
+	cleanPath := filepath.Clean(relPath)
+	if cleanPath == "." || cleanPath == string(os.PathSeparator) || cleanPath == "" {
+		return ""
+	}
+	// 取最后一层目录（即直接父目录）
+	parentDir := filepath.Base(cleanPath)
+	if parentDir == "" || parentDir == "." {
+		return ""
+	}
+	return parentDir
 }
 
 // downloadDocument 下载单个飞书文档并转换为Markdown
@@ -412,6 +430,15 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 	fmBuilder.WriteString("title: " + escapeYAML(fmTitle) + "\n")
 	fmBuilder.WriteString("date: " + fmDate + "\n")
 	fmBuilder.WriteString("updated: " + fmUpdated + "\n")
+	// categories: 使用提供的 category，或从第一个 tag 推导，或使用文档标题的第一个词
+	fmCategory := opts.category
+	if fmCategory == "" && len(opts.tags) > 0 {
+		fmCategory = opts.tags[0] // 使用第一个 tag 作为 category
+	}
+	if fmCategory == "" {
+		fmCategory = "未分类" // 默认分类
+	}
+	fmBuilder.WriteString("categories: " + escapeYAML(fmCategory) + "\n")
 	if len(opts.tags) > 0 {
 		fmBuilder.WriteString("tags:\n")
 		for _, tag := range opts.tags {
@@ -421,6 +448,8 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 			fmBuilder.WriteString("  - " + escapeYAML(tag) + "\n")
 		}
 	}
+	// id: 使用 docToken 作为唯一标识
+	fmBuilder.WriteString("id: " + escapeYAML(docToken) + "\n")
 	fmBuilder.WriteString("---\n\n")
 
 	// 合并 frontmatter 与正文
@@ -765,6 +794,7 @@ func downloadWikiChildren(ctx context.Context, client *core.Client, url string, 
 					nodeToken:     n.NodeToken,
 					relDir:        nodePath,
 					tags:          deriveTagsFromPath(nodePath),
+					category:      deriveCategoryFromPath(nodePath),
 				}
 
 				// 移除冗余的下载路径输出
