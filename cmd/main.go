@@ -203,17 +203,13 @@ func main() {
 					"  - 支持并发下载\n\n" +
 					"示例:\n" +
 					"  feishu2md wiki-tree https://example.feishu.cn/wiki/abc123\n" +
-					"  feishu2md wiki-tree --tag-mode=all --category-mode=all",
+					"  feishu2md wiki-tree --category-level=1  # 取第1层目录作为分类\n" +
+					"  feishu2md wiki-tree --category-level=-1 # 取最后一层目录作为分类",
 				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name:  "tag-mode",
-						Usage: "标签生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
-						Value: "last",
-					},
-					&cli.StringFlag{
-						Name:  "category-mode",
-						Usage: "分类生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
-						Value: "last",
+					&cli.IntFlag{
+						Name:  "category-level",
+						Usage: "分类取第几层目录: 正数从外向内(1=第一层), 负数从内向外(-1=最后一层), 层级不够时回退到最近层",
+						Value: 1,
 					},
 				},
 				Action: handleWikiTreeCommand,
