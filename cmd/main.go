@@ -72,18 +72,6 @@ func main() {
 				Name:  "json",
 				Usage: "导出JSON响应",
 			},
-
-			// === 元数据选项 ===
-			&cli.StringFlag{
-				Name:  "tag-mode",
-				Usage: "标签生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
-				Value: "last",
-			},
-			&cli.StringFlag{
-				Name:  "category-mode",
-				Usage: "分类生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
-				Value: "last",
-			},
 		},
 		ArgsUsage: "<url>",
 		// 未指定子命令时的默认操作 - 作为下载处理
@@ -215,7 +203,19 @@ func main() {
 					"  - 支持并发下载\n\n" +
 					"示例:\n" +
 					"  feishu2md wiki-tree https://example.feishu.cn/wiki/abc123\n" +
-					"  feishu2md wiki-tree  # 使用 .env 中配置的 FEISHU_FOLDER_TOKEN",
+					"  feishu2md wiki-tree --tag-mode=all --category-mode=all",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "tag-mode",
+						Usage: "标签生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
+						Value: "last",
+					},
+					&cli.StringFlag{
+						Name:  "category-mode",
+						Usage: "分类生成模式: last(只取最后一层目录,默认) / all(取所有层级目录)",
+						Value: "last",
+					},
+				},
 				Action: handleWikiTreeCommand,
 			},
 
