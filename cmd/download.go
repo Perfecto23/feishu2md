@@ -16,7 +16,7 @@ import (
 
 	"github.com/88250/lute"
 	"github.com/Perfecto23/feishu2md/core"
-	"github.com/Perfecto23/feishu2md/imgbed"
+	"github.com/Perfecto23/feishu2md/picgo"
 	"github.com/Perfecto23/feishu2md/utils"
 	"github.com/chyroc/lark"
 	"github.com/pkg/errors"
@@ -279,24 +279,15 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 			uniqueTokens = append(uniqueTokens, t)
 		}
 
-		// 初始化图床上传器（如果启用了图床）
-		var uploader *imgbed.Uploader
-		if imgbed.IsEnabled(&dlConfig.ImageBed) {
-			var err error
-			uploader, err = imgbed.NewUploader(&dlConfig.ImageBed)
-			if err != nil {
-				fmt.Printf("⚠️  创建图床上传器失败: %v\n", err)
-				uploader = nil
-			}
-		}
+		// 检查 PicGo 是否启用
+		picgoEnabled := dlConfig.PicGo.Enabled && picgo.IsAvailable()
 
 		// 控制单文档内图片下载并发度
-		// 提高到16个并发（限流器会自动控制）
 		maxImgConcurrency := 16
 		type result struct {
 			token, link string
-			fromImgbed  bool // 是否从图床直接获取
-			needUpload  bool // 是否需要上传到图床
+			fromCache   bool // 是否从缓存获取
+			needUpload  bool // 是否需要上传到 PicGo
 			err         error
 		}
 		jobs := make(chan string)
@@ -305,32 +296,27 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 
 		worker := func() {
 			for token := range jobs {
-				// 优化：如果启用图床，用token前缀查找（支持任意扩展名）
-				if uploader != nil {
-					platform := uploader.GetPlatform()
-
-					// 1. 通过前缀查找图床（无需猜测扩展名，无需调用飞书API！）
-					found, imgbedURL, _ := platform.FindByPrefix(ctx, token)
-					if found {
-						// 图床已存在，直接使用图床URL，完全跳过下载！⚡
-						results <- result{token: token, link: imgbedURL, fromImgbed: true, needUpload: false, err: nil}
+				// 1. 检查 PicGo 缓存
+				if picgoEnabled {
+					if cachedURL, ok := picgo.GetCached(token); ok {
+						results <- result{token: token, link: cachedURL, fromCache: true, needUpload: false, err: nil}
 						continue
 					}
 				}
 
-				// 2. 图床不存在或未启用图床，从飞书下载
+				// 2. 从飞书下载图片
 				localLink, err := client.DownloadImage(ctx, token, outImgDir)
 				if err != nil {
-					results <- result{token: token, link: "", fromImgbed: false, needUpload: false, err: err}
+					results <- result{token: token, link: "", fromCache: false, needUpload: false, err: err}
 					continue
 				}
 
-				// 3. 下载成功，如果启用了图床，标记需要上传
-				if uploader != nil {
-					results <- result{token: token, link: localLink, fromImgbed: false, needUpload: true, err: nil}
+				// 3. 下载成功，如果启用了 PicGo，标记需要上传
+				if picgoEnabled {
+					results <- result{token: token, link: localLink, fromCache: false, needUpload: true, err: nil}
 				} else {
-					// 未启用图床，使用本地路径
-					results <- result{token: token, link: localLink, fromImgbed: false, needUpload: false, err: nil}
+					// 未启用 PicGo，使用本地路径
+					results <- result{token: token, link: localLink, fromCache: false, needUpload: false, err: nil}
 				}
 			}
 		}
@@ -342,56 +328,50 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 		}
 		close(jobs)
 
-		// 收集结果并替换链接
+		// 收集结果
 		successCount := 0
-		imgbedHitCount := 0
-		failedTokens := 0
+		cacheHitCount := 0
 		tokenToLink := make(map[string]string, len(uniqueTokens))
-		needUploadImages := make(map[string]string) // 记录需要上传到图床的图片
+		needUploadImages := make(map[string]string) // token -> localLink
+
 		for i := 0; i < len(uniqueTokens); i++ {
 			r := <-results
 			if r.err != nil {
 				fmt.Printf("⚠️  图片下载失败: %v\n", r.err)
-				failedTokens++
 				continue
 			}
 			tokenToLink[r.token] = r.link
 			successCount++
 
-			if r.fromImgbed {
-				// 从图床直接获取
-				imgbedHitCount++
+			if r.fromCache {
+				cacheHitCount++
 			} else if r.needUpload {
-				// 需要上传到图床
 				needUploadImages[r.token] = r.link
 			}
 		}
 
-		// 一次性替换，避免多次 strings.Replace 带来的重复扫描
+		// 处理需要上传的图片
 		if successCount > 0 {
-			// 如果有图片需要上传到图床
-			uploadedCount := 0
-			if uploader != nil && len(needUploadImages) > 0 {
+			if picgoEnabled && len(needUploadImages) > 0 {
 				// 收集需要上传的图片路径
 				localPaths := make([]string, 0, len(needUploadImages))
-				for _, link := range needUploadImages {
-					fullPath := filepath.Join(opts.outputDir, link)
-					localPaths = append(localPaths, fullPath)
-				}
-
-				// 批量上传到图床
-				imgbedURLs := uploader.BatchUploadFromLocal(ctx, localPaths)
-
-				// 替换tokenToLink中的链接为图床URL，并删除已上传的本地文件
+				tokenByPath := make(map[string]string, len(needUploadImages))
 				for token, link := range needUploadImages {
 					fullPath := filepath.Join(opts.outputDir, link)
-					if imgbedURL, ok := imgbedURLs[fullPath]; ok {
-						tokenToLink[token] = imgbedURL
-						uploadedCount++
+					localPaths = append(localPaths, fullPath)
+					tokenByPath[fullPath] = token
+				}
 
-						// 上传成功后删除本地图片
-						os.Remove(fullPath)
-					}
+				// 批量上传到 PicGo（内部已处理缓存保存）
+				picgoURLs := picgo.BatchUpload(ctx, localPaths)
+
+				// 替换 tokenToLink 中的链接为 PicGo URL，并删除已上传的本地文件
+				for fullPath, picgoURL := range picgoURLs {
+					token := tokenByPath[fullPath]
+					tokenToLink[token] = picgoURL
+
+					// 上传成功后删除本地图片
+					os.Remove(fullPath)
 				}
 
 				// 尝试删除空的图片目录
@@ -401,22 +381,19 @@ func downloadDocument(ctx context.Context, client *core.Client, url string, opts
 				}
 			}
 
-			// 替换markdown中的token为最终链接（本地链接或图床链接）
+			// 替换 markdown 中的 token 为最终链接
 			for token, link := range tokenToLink {
 				markdown = strings.ReplaceAll(markdown, token, link)
 			}
 
 			if dlStats != nil {
-				// 注意：successCount 包含从飞书下载的图片（需要上传的）
-				// imgbedHitCount 是从图床直接获取的（不算新增）
-				downloaded := len(needUploadImages) // 只有需要上传的才是真正新下载的
+				downloaded := len(needUploadImages)
 				dlStats.AddImages(len(uniqueTokens), downloaded)
-				// 把图片统计合并到当前文档日志（最后汇总输出）
 				pathForLog := mdName
 				if opts.relDir != "" {
 					pathForLog = filepath.Join(opts.relDir, mdName)
 				}
-				logCollector.Add(DocLog{Path: pathForLog, ImgCache: imgbedHitCount, ImgNew: downloaded})
+				logCollector.Add(DocLog{Path: pathForLog, ImgCache: cacheHitCount, ImgNew: downloaded})
 			}
 		}
 	}

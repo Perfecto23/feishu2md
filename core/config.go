@@ -8,9 +8,9 @@ import (
 
 // Config 表示 feishu2md 应用程序的完整配置
 type Config struct {
-	Feishu   FeishuConfig   // 飞书 API 配置
-	Output   OutputConfig   // 输出格式配置
-	ImageBed ImageBedConfig // 图床配置
+	Feishu FeishuConfig // 飞书 API 配置
+	Output OutputConfig // 输出格式配置
+	PicGo  PicGoConfig  // PicGo 图床配置
 }
 
 // FeishuConfig 包含飞书/LarkSuite API 凭据
@@ -29,17 +29,9 @@ type OutputConfig struct {
 	NoBodyTitle     bool   // 禁用正文开头的 H1 标题（因为 frontmatter 已包含 title）
 }
 
-// ImageBedConfig 包含图床配置
-type ImageBedConfig struct {
-	Enabled   bool   // 是否启用图床上传
-	Platform  string // 图床平台: oss, cos
-	SecretID  string // 密钥ID (阿里云AccessKeyID / 腾讯云SecretID)
-	SecretKey string // 密钥Key (阿里云AccessKeySecret / 腾讯云SecretKey)
-	Bucket    string // 存储桶名称
-	Region    string // 存储区域
-	Host      string // 自定义域名（可选）
-	PrefixKey string // 上传路径前缀（可选）
-	SecretExt string // 密钥扩展点（可选）
+// PicGoConfig 包含 PicGo 图床配置
+type PicGoConfig struct {
+	Enabled bool // 是否启用 PicGo 图床上传
 }
 
 // NewConfig 使用提供的应用凭据和默认输出设置创建新配置
@@ -84,8 +76,8 @@ func LoadConfig(appId, appSecret string) (*Config, error) {
 	// 加载输出配置（从环境变量）
 	loadOutputConfig(config)
 
-	// 加载图床配置（从环境变量）
-	loadImageBedConfig(config)
+	// 加载 PicGo 配置（从环境变量）
+	loadPicGoConfig(config)
 
 	return config, nil
 }
@@ -102,36 +94,10 @@ func loadOutputConfig(config *Config) {
 	}
 }
 
-// loadImageBedConfig 从环境变量加载图床配置
-func loadImageBedConfig(config *Config) {
-	// 检查是否启用图床
-	if enabled := os.Getenv("IMGBED_ENABLED"); enabled == "true" || enabled == "1" {
-		config.ImageBed.Enabled = true
-	}
-
-	// 加载图床平台配置
-	if platform := os.Getenv("IMGBED_PLATFORM"); platform != "" {
-		config.ImageBed.Platform = platform
-	}
-	if secretID := os.Getenv("IMGBED_SECRET_ID"); secretID != "" {
-		config.ImageBed.SecretID = secretID
-	}
-	if secretKey := os.Getenv("IMGBED_SECRET_KEY"); secretKey != "" {
-		config.ImageBed.SecretKey = secretKey
-	}
-	if bucket := os.Getenv("IMGBED_BUCKET"); bucket != "" {
-		config.ImageBed.Bucket = bucket
-	}
-	if region := os.Getenv("IMGBED_REGION"); region != "" {
-		config.ImageBed.Region = region
-	}
-	if host := os.Getenv("IMGBED_HOST"); host != "" {
-		config.ImageBed.Host = host
-	}
-	if prefixKey := os.Getenv("IMGBED_PREFIX_KEY"); prefixKey != "" {
-		config.ImageBed.PrefixKey = prefixKey
-	}
-	if secretExt := os.Getenv("IMGBED_SECRET_EXT"); secretExt != "" {
-		config.ImageBed.SecretExt = secretExt
+// loadPicGoConfig 从环境变量加载 PicGo 配置
+func loadPicGoConfig(config *Config) {
+	// 检查是否启用 PicGo
+	if enabled := os.Getenv("PICGO_ENABLED"); enabled == "true" || enabled == "1" {
+		config.PicGo.Enabled = true
 	}
 }

@@ -46,76 +46,33 @@ FEISHU_APP_SECRET=your_app_secret_here
 
 
 # ====================================
-# 图床配置（可选）
+# PicGo 图床配置（可选）
 # ====================================
-# 启用后，下载的图片会自动上传到图床
+# 启用后，下载的图片会通过 PicGo 上传到图床
 # 并将 Markdown 中的图片链接替换为图床 URL
+#
+# 前置条件：
+# 1. 安装 PicGo CLI: npm install picgo -g
+# 2. 安装压缩插件（可选）: picgo add compress
+# 3. 配置图床: picgo set uploader
+# 4. 配置压缩（可选）: picgo config plugin compress
+#
+# PicGo 支持的图床:
+# - SM.MS (smms)
+# - GitHub (github)
+# - 腾讯云 COS (tcyun)
+# - 阿里云 OSS (aliyun)
+# - 七牛云 (qiniu)
+# - 又拍云 (upyun)
+# - Imgur (imgur)
+# 更多图床可通过 PicGo 插件扩展
 
 # ----------------------------------
-# 图床开关
+# PicGo 开关
 # ----------------------------------
-# 是否启用图床上传功能
+# 是否启用 PicGo 图床上传功能
 # 值: true/false 或 1/0
-IMGBED_ENABLED=false
-
-# ----------------------------------
-# 图床平台选择
-# ----------------------------------
-# 支持的平台: oss (阿里云) / cos (腾讯云)
-IMGBED_PLATFORM=oss
-
-
-# ==== 阿里云 OSS 配置 ====
-# 使用阿里云 OSS 时填写以下配置
-
-# 访问密钥 ID (AccessKey ID)
-IMGBED_SECRET_ID=your_aliyun_access_key_id
-
-# 访问密钥 (AccessKey Secret)
-IMGBED_SECRET_KEY=your_aliyun_access_key_secret
-
-# 存储桶名称
-IMGBED_BUCKET=your-bucket-name
-
-# 存储区域
-# 可选值: oss-cn-hangzhou, oss-cn-beijing, oss-cn-shanghai, oss-cn-shenzhen 等
-# 完整列表: https://help.aliyun.com/document_detail/31837.html
-IMGBED_REGION=oss-cn-hangzhou
-
-# 自定义域名（可选）
-# 如果配置了 CDN 加速域名，填写此项
-# 例如: cdn.example.com
-# FEISHU_IMGBED_HOST=
-
-# 上传路径前缀（可选）
-# 图片上传到 OSS 的路径前缀，例如: images/
-# IMGBED_PREFIX_KEY=images/
-
-
-# ==== 腾讯云 COS 配置 ====
-# 使用腾讯云 COS 时填写以下配置（与阿里云配置共用变量名）
-
-# 访问密钥 ID (SecretId)
-# IMGBED_SECRET_ID=your_tencent_secret_id
-
-# 访问密钥 (SecretKey)
-# IMGBED_SECRET_KEY=your_tencent_secret_key
-
-# 存储桶名称
-# 格式: bucket-appid，例如: my-bucket-1234567890
-# IMGBED_BUCKET=your-bucket-appid
-
-# 存储区域
-# 可选值: ap-guangzhou, ap-beijing, ap-shanghai, ap-chengdu 等
-# 完整列表: https://cloud.tencent.com/document/product/436/6224
-# IMGBED_REGION=ap-guangzhou
-
-# 自定义域名（可选）
-# 如果配置了 CDN 加速域名，填写此项
-# FEISHU_IMGBED_HOST=
-
-# 上传路径前缀（可选）
-# IMGBED_PREFIX_KEY=images/
+PICGO_ENABLED=false
 
 
 # ----------------------------------
@@ -128,6 +85,13 @@ IMGBED_REGION=oss-cn-hangzhou
 #    feishu2md document <url>
 # 3. 也可以手动加载环境变量:
 #    source .env  (Linux/macOS)
+#
+# PicGo 图床配置步骤:
+# 1. npm install picgo -g           # 安装 PicGo
+# 2. picgo add compress             # 安装压缩插件（可选）
+# 3. picgo set uploader github      # 配置 GitHub 图床（或其他）
+# 4. picgo config plugin compress   # 配置压缩选项（可选）
+# 5. 设置 PICGO_ENABLED=true        # 启用 PicGo
 #
 # 注意: .env 文件包含敏感信息，请勿提交到 Git 仓库
 #       本项目的 .gitignore 已默认忽略 .env 文件
@@ -162,7 +126,7 @@ func handleInitCommand(ctx *cli.Context) error {
 	fmt.Println("💡 提示:")
 	fmt.Println("  - 工具会自动加载当前目录的 .env 文件")
 	fmt.Println("  - 也可使用 --config 指定其他配置文件: feishu2md --config my.env document <url>")
-	fmt.Println("  - 图床功能为可选，不需要可保持 IMGBED_ENABLED=false")
+	fmt.Println("  - 图床功能为可选，不需要可保持 PICGO_ENABLED=false")
 	fmt.Println("  - .env 文件已在 .gitignore 中，不会被提交到版本控制")
 
 	return nil
