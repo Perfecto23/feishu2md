@@ -175,13 +175,18 @@ func main() {
 					"示例:\n" +
 					"  feishu2md wiki https://example.feishu.cn/wiki/space/abc123\n" +
 					"  feishu2md w https://example.feishu.cn/wiki/space/abc123 --skip-same",
-				Action: func(ctx *cli.Context) error {
-					if ctx.NArg() == 0 {
-						return cli.Exit("错误: 请指定知识库URL\n\n示例: feishu2md wiki https://example.feishu.cn/wiki/space/xxx", 1)
-					}
-					url := ctx.Args().First()
-					return handleWikiDownload(ctx, url)
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "category-level",
+						Usage: "分类取第几层目录: 正数从外向内(1=第一层), 负数从内向外(-1=最后一层), 层级不够时回退到最近层",
+						Value: 1,
+					},
+					&cli.BoolFlag{
+						Name:  "no-body-title",
+						Usage: "禁用正文开头的H1标题（frontmatter已含title）",
+					},
 				},
+				Action: handleWikiCommand,
 			},
 
 			// 知识库子文档下载

@@ -593,84 +593,187 @@ func downloadDocuments(ctx context.Context, client *core.Client, url string, opt
 	return nil
 }
 
-// downloadWiki 下载知识库中的所有文档
+// downloadWiki 下载知识库中的所有文档（全量导出）
+// 策略：先收集所有节点（根节点 + 递归子节点），构建路径映射，再并发下载
 func downloadWiki(ctx context.Context, client *core.Client, url string, opts *DownloadOpts) error {
+	startTime := time.Now()
+
 	prefixURL, spaceID, err := utils.ValidateWikiURL(url)
 	if err != nil {
 		return err
 	}
 
-	folderPath, err := client.GetWikiName(ctx, spaceID)
+	fmt.Printf("🔍 正在获取知识库全量节点 (spaceID: %s)...\n", spaceID)
+
+	// === Step A: 节点收集 ===
+	// 1. 获取根节点列表（ParentNodeToken 为 nil 才能获取根节点）
+	rootItems, err := client.GetWikiNodeList(ctx, spaceID, nil)
 	if err != nil {
-		return err
-	}
-	if folderPath == "" {
-		return fmt.Errorf("failed to GetWikiName")
+		return fmt.Errorf("获取根节点列表失败: %v", err)
 	}
 
-	errChan := make(chan error)
-
-	var maxConcurrency = 10 // 设置最大并发级别
-	wg := sync.WaitGroup{}
-	semaphore := make(chan struct{}, maxConcurrency) // 创建具有最大并发级别的信号量
-
-	var downloadWikiNode func(ctx context.Context,
-		client *core.Client,
-		spaceID string,
-		parentPath string,
-		parentNodeToken *string) error
-
-	downloadWikiNode = func(ctx context.Context,
-		client *core.Client,
-		spaceID string,
-		folderPath string,
-		parentNodeToken *string) error {
-		nodes, err := client.GetWikiNodeList(ctx, spaceID, parentNodeToken)
-		if err != nil {
-			return err
+	// 2. 转换根节点为 Document 格式，并递归获取所有后代
+	var allNodes []*core.Document
+	for _, item := range rootItems {
+		rootDoc := &core.Document{
+			Token:       item.ObjToken,
+			NodeToken:   item.NodeToken,
+			Name:        item.Title,
+			Type:        item.ObjType,
+			ParentToken: "", // 根节点无父节点
+			HasChild:    item.HasChild,
 		}
-		for _, n := range nodes {
-			if n.HasChild {
-				_folderPath := filepath.Join(folderPath, n.Title)
-				if err := downloadWikiNode(ctx, client,
-					spaceID, _folderPath, &n.NodeToken); err != nil {
-					return err
+		allNodes = append(allNodes, rootDoc)
+
+		// 3. 对有子节点的根节点，递归获取所有后代
+		if item.HasChild {
+			children, err := client.GetAllChildNodes(ctx, spaceID, item.NodeToken)
+			if err != nil {
+				return fmt.Errorf("获取子节点失败 (root: %s): %v", item.Title, err)
+			}
+			allNodes = append(allNodes, children...)
+		}
+	}
+
+	if len(allNodes) == 0 {
+		fmt.Println("📭 知识库为空，未找到任何文档")
+		return nil
+	}
+
+	// 统计可下载的文档数
+	docCount := 0
+	for _, n := range allNodes {
+		if n.Type == "docx" {
+			docCount++
+		}
+	}
+	fmt.Printf("📚 找到 %d 个节点，其中 %d 个可下载文档\n", len(allNodes), docCount)
+
+	// 初始化统计器
+	dlStats = &DownloadStats{}
+	dlStats.SetTotalDocs(docCount)
+	logCollector = &LogCollector{}
+
+	// === Step B: pathMap 构建 ===
+	// 根节点路径 = 其标题（sanitized），子节点路径 = Join(父节点路径, 子节点标题)
+	pathMap := make(map[string]string)
+
+	// 先为根节点建立路径
+	for _, item := range rootItems {
+		pathMap[item.NodeToken] = utils.SanitizeFileName(item.Title)
+	}
+
+	// 递归构建路径映射（复用 downloadWikiChildren 的逻辑）
+	var buildPaths func(parentToken, parentPath string)
+	buildPaths = func(parentToken, parentPath string) {
+		for _, node := range allNodes {
+			if node.ParentToken == parentToken {
+				nodePath := filepath.Join(parentPath, utils.SanitizeFileName(node.Name))
+				pathMap[node.NodeToken] = nodePath
+				if node.HasChild {
+					buildPaths(node.NodeToken, nodePath)
 				}
 			}
-			if n.ObjType == "docx" {
-				wikiOpts := DownloadOpts{
-					outputDir:     folderPath,
+		}
+	}
+
+	for _, item := range rootItems {
+		rootPath := pathMap[item.NodeToken]
+		buildPaths(item.NodeToken, rootPath)
+	}
+
+	// === Step C: 并发下载 ===
+	// 并发度 20：限流器(100次/分钟+5次/秒)会自动控制 API 调用速率
+	var maxConcurrency = 20
+	errChan := make(chan error, len(allNodes))
+	wg := sync.WaitGroup{}
+	semaphore := make(chan struct{}, maxConcurrency)
+
+	for _, node := range allNodes {
+		if node.Type == "docx" {
+			wg.Add(1)
+			semaphore <- struct{}{}
+
+			go func(n *core.Document) {
+				defer func() {
+					wg.Done()
+					<-semaphore
+				}()
+
+				// 确定文档的输出目录：使用父节点的路径
+				nodePath := pathMap[n.ParentToken]
+				if nodePath == "" {
+					// 根节点文档：使用其自身路径的父目录（即 "."）
+					nodePath = "."
+				}
+
+				fullOutputDir := filepath.Join(opts.outputDir, nodePath)
+				if err := os.MkdirAll(fullOutputDir, 0o755); err != nil {
+					errChan <- fmt.Errorf("创建目录失败 %s: %v", fullOutputDir, err)
+					return
+				}
+
+				docURL := prefixURL + "/wiki/" + n.NodeToken
+				localOpts := DownloadOpts{
+					outputDir:     fullOutputDir,
 					dumpJSON:      opts.dumpJSON,
 					skipDuplicate: opts.skipDuplicate,
 					forceDownload: opts.forceDownload,
 					spaceID:       spaceID,
 					nodeToken:     n.NodeToken,
+					relDir:        nodePath,
+					categoryLevel: opts.categoryLevel,
+					tags:          deriveTagsFromPath(nodePath),
+					category:      deriveCategoryFromPath(nodePath, opts.categoryLevel),
 				}
-				wg.Add(1)
-				semaphore <- struct{}{}
-				go func(_url string) {
-					if err := downloadDocument(ctx, client, _url, &wikiOpts); err != nil {
-						errChan <- err
-					}
-					wg.Done()
-					<-semaphore
-				}(prefixURL + "/wiki/" + n.NodeToken)
-			}
+
+				if err := downloadDocument(ctx, client, docURL, &localOpts); err != nil {
+					errChan <- fmt.Errorf("下载文档失败 %s: %v", n.Name, err)
+				}
+			}(node)
 		}
-		return nil
 	}
 
-	if err = downloadWikiNode(ctx, client, spaceID, folderPath, nil); err != nil {
-		return err
-	}
-
-	// Wait for all the downloads to finish
+	// 等待所有下载完成
 	go func() {
 		wg.Wait()
 		close(errChan)
 	}()
+
 	for err := range errChan {
-		return err
+		if err != nil {
+			return err
+		}
+	}
+
+	// === Step D: 统计输出 ===
+	elapsed := time.Since(startTime)
+
+	fmt.Println()
+	fmt.Println("📦 处理结果：")
+	for _, l := range logCollector.SortedByPath() {
+		status := "缓存"
+		if l.DocNew {
+			status = "新增"
+		} else if l.Skipped {
+			status = "跳过"
+		}
+		if l.Reason != "" {
+			status += " (" + l.Reason + ")"
+		}
+		fmt.Printf("- %s  [%s]", l.Path, status)
+		if l.ImgCache > 0 || l.ImgNew > 0 {
+			fmt.Printf("  | 图片: +%d / 命中%d", l.ImgNew, l.ImgCache)
+		}
+		fmt.Println()
+	}
+
+	totalDocs, docsNew, totalImages, imagesNew := dlStats.Snapshot()
+	changes := docsNew + imagesNew
+	if changes == 0 {
+		fmt.Printf("🎉 完成！共 %d 个文档、%d 张图片，全部已缓存、无更新。耗时: %.2fs\n", totalDocs, totalImages, elapsed.Seconds())
+	} else {
+		fmt.Printf("🎉 完成！共 %d 个文档、%d 张图片，其中新增文档 %d、新增图片 %d，共 %d 处变更。耗时: %.2fs\n", totalDocs, totalImages, docsNew, imagesNew, changes, elapsed.Seconds())
 	}
 	return nil
 }
@@ -966,6 +1069,51 @@ func handleFolderDownload(cliCtx *cli.Context, url string) error {
 	ctx := context.Background()
 
 	return downloadDocuments(ctx, client, url, opts)
+}
+
+// handleWikiCommand 处理 wiki 命令入口（支持 CLI 参数和环境变量）
+func handleWikiCommand(cliCtx *cli.Context) error {
+	// 先加载配置文件
+	configPath := cliCtx.String("config")
+	if configPath != "" {
+		if err := core.LoadEnvFileIfExists(configPath); err != nil {
+			return fmt.Errorf("加载配置文件失败: %w", err)
+		}
+	}
+
+	// 获取 URL：优先使用命令行参数，其次使用环境变量自动拼接
+	var url string
+	if cliCtx.NArg() > 0 {
+		url = cliCtx.Args().First()
+	} else {
+		// 从环境变量自动构造 wiki space URL
+		spaceID := os.Getenv("FEISHU_SPACE_ID")
+		folderToken := os.Getenv("FEISHU_FOLDER_TOKEN")
+
+		if spaceID != "" {
+			// 从 FEISHU_FOLDER_TOKEN 提取域名（如果是完整 URL）
+			domain := "feishu.cn"
+			if folderToken != "" {
+				if parts := strings.SplitN(folderToken, "/wiki/", 2); len(parts) == 2 {
+					// 从 https://xxx.feishu.cn/wiki/xxx 提取域名部分
+					domainPart := strings.TrimPrefix(parts[0], "https://")
+					if domainPart != "" {
+						domain = domainPart
+					}
+				}
+			}
+			url = "https://" + domain + "/wiki/space/" + spaceID
+		}
+	}
+
+	if url == "" {
+		return cli.Exit("错误: 请指定知识库URL\n\n"+
+			"方式一: feishu2md wiki <URL>\n"+
+			"方式二: 在配置文件中设置 FEISHU_SPACE_ID（自动构造URL）\n\n"+
+			"示例: feishu2md wiki https://example.feishu.cn/wiki/space/xxx", 1)
+	}
+
+	return handleWikiDownload(cliCtx, url)
 }
 
 // handleWikiDownload 处理知识库完整下载
